@@ -339,6 +339,7 @@ func main() {
 		Live:         live,
 		Usage:        rec,
 		RequestLog:   requestLog,
+		Listen:       cfg.Listen,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的

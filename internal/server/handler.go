@@ -31,6 +31,7 @@ import (
 // Config handler 依赖。
 type Config struct {
 	Pool      *pool.Pool
+	Listen    string // 本网关监听地址（如 ":7863"）；/v1/responses 内部回环转发用
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
@@ -141,6 +142,8 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// OpenAI Responses API 原生入口（Codex CLI 等直连，不再需要外部 bridge）。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
