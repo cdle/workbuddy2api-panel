@@ -309,6 +309,100 @@ const (
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
+// applyCodexCatalogFields 补齐 Codex 桌面端模型目录所需字段。
+// Codex 对 /v1/models 的 models schema 校验严格：缺 slug / supported_reasoning_levels /
+// base_instructions 等字段时会丢弃整个目录，回退到内置 OpenAI 模型集（选择器显示
+// 6.x Sol 之类，与网关无关）。全部为新增字段，不影响按 id/object 消费的
+// OpenAI 风格客户端（Hermes / 面板 / kimi-code）。
+func applyCodexCatalogFields(entry map[string]any) {
+	id, _ := entry["id"].(string)
+	if id == "" {
+		return
+	}
+	toInt := func(v any) (int, bool) {
+		switch n := v.(type) {
+		case int:
+			return n, true
+		case int64:
+			return int(n), true
+		case float64:
+			return int(n), true
+		}
+		return 0, false
+	}
+	ctxLen, _ := toInt(entry["context_length"])
+	maxCtx := ctxLen
+	if v, ok := toInt(entry["max_allowed_size"]); ok {
+		maxCtx = v
+	}
+	name, _ := entry["name"].(string)
+
+	efforts, _ := entry["reasoning_supported_efforts"].([]string)
+	defEffort, _ := entry["reasoning_default_effort"].(string)
+	levels := make([]map[string]any, 0, len(efforts))
+	for _, e := range efforts {
+		levels = append(levels, map[string]any{"effort": e, "description": e + " reasoning depth"})
+	}
+	if len(levels) == 0 {
+		levels = []map[string]any{
+			{"effort": "low", "description": "low reasoning depth"},
+			{"effort": "medium", "description": "medium reasoning depth"},
+			{"effort": "high", "description": "high reasoning depth"},
+			{"effort": "xhigh", "description": "xhigh reasoning depth"},
+		}
+	}
+	if defEffort == "" {
+		defEffort = "medium"
+	}
+
+	img, _ := entry["supports_images"].(bool)
+	modalities := []string{"text"}
+	if img {
+		modalities = append(modalities, "image")
+	}
+	tool := true
+	if v, ok := entry["supports_tool_call"].(bool); ok {
+		tool = v
+	}
+	reason, _ := entry["supports_reasoning"].(bool)
+
+	entry["slug"] = id
+	if name != "" {
+		entry["display_name"] = name
+	}
+	entry["default_reasoning_level"] = defEffort
+	entry["supported_reasoning_levels"] = levels
+	entry["shell_type"] = "shell_command"
+	entry["visibility"] = "list"
+	entry["supported_in_api"] = true
+	entry["supports_websockets"] = false
+	entry["priority"] = 1
+	entry["base_instructions"] = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals."
+	entry["model_messages"] = map[string]any{
+		"instructions_template": "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.\n\n{{ personality }}",
+		"instructions_variables": map[string]any{
+			"personality_default":  "",
+			"personality_friendly": "# Personality\n\nBe warm, collaborative, and supportive.",
+			"personality_pragmatic": "# Personality\n\nBe pragmatic, direct, and concise.",
+		},
+	}
+	entry["default_reasoning_summary"] = "none"
+	entry["support_verbosity"] = true
+	entry["default_verbosity"] = "low"
+	entry["apply_patch_tool_type"] = "freeform"
+	entry["web_search_tool_type"] = "text_and_image"
+	entry["truncation_policy"] = map[string]any{"mode": "tokens", "limit": 10000}
+	entry["context_window"] = ctxLen
+	entry["max_context_window"] = maxCtx
+	entry["effective_context_window_percent"] = 95
+	entry["supports_parallel_tool_calls"] = tool
+	entry["supports_reasoning_summaries"] = reason
+	entry["supports_image_detail_original"] = true
+	entry["experimental_supported_tools"] = []any{}
+	entry["input_modalities"] = modalities
+	entry["supports_search_tool"] = true
+}
+
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -424,6 +518,7 @@ func (h *Handler) modelList() []map[string]any {
 				entry["reasoning_default_effort"] = def
 			}
 		}
+		applyCodexCatalogFields(entry)
 		out = append(out, entry)
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
@@ -466,8 +561,9 @@ func (h *Handler) modelList() []map[string]any {
 					entry["reasoning_default_effort"] = def
 				}
 			}
+			applyCodexCatalogFields(entry)
 			out = append(out, entry)
-		}
+			}
 	}
 	return out
 }
