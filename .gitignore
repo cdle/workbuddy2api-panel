@@ -45,3 +45,5 @@ docs/
 *.zip
 server.exe
 .DS_Store
+/workbuddy2api
+/workbuddy2api.pre-catalog
