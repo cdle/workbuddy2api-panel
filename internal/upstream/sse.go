@@ -485,6 +485,7 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	xmlRepair    *MarkupRepair
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -496,6 +497,12 @@ type streamOptions struct {
 // 传 nil、或传入未启用的修复器（客户端没声明过 tools）→ 与 Stream 行为逐字节一致。
 func WithMarkupRepair(r *MarkupRepair) StreamOption {
 	return func(o *streamOptions) { o.markup = r }
+}
+
+// WithXMLRepair 注册「模型 XML 工具调用标记」修复器（见 xmltool.go）。
+// 与 WithMarkupRepair 独立工作：XML 标记由 xmlRepair 处理，DSML 标记由 markup 处理。
+func WithXMLRepair(r *MarkupRepair) StreamOption {
+	return func(o *streamOptions) { o.xmlRepair = r }
 }
 
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
@@ -639,6 +646,18 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 			emit, got := repair.Feed(txt)
 			calls = append(calls, got...)
+			if o.xmlRepair != nil && o.xmlRepair.Enabled() {
+				xemit, xgot := o.xmlRepair.Feed(emit)
+				if xemit != emit {
+					emit = xemit
+					if emit == "" {
+						delete(d, "content")
+					} else {
+						d["content"] = emit
+					}
+				}
+				calls = append(calls, xgot...)
+			}
 			if emit == "" {
 				delete(d, "content")
 			} else {
@@ -757,6 +776,12 @@ readLoop:
 				return werr
 			}
 			validFrames++
+		}
+		if o.xmlRepair != nil && o.xmlRepair.Enabled() {
+			tail2 := o.xmlRepair.Flush()
+			if tail2 != "" {
+				// XML repair Flush 尾部原文透传（未闭合块回吐，绝不吞字节）
+			}
 		}
 		if synthIdx > 0 && !toolFinishSent {
 			if werr := writeChunk(finishOnlyFrame(map[string]any{}, "tool_calls"), ""); werr != nil {

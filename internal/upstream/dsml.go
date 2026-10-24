@@ -432,17 +432,33 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 			continue
 		}
 		text, _ := msg["content"].(string)
-		if text == "" || !strings.Contains(text, markupPipe) {
+		if text == "" {
 			continue
 		}
-		emit, calls := r.Feed(text)
-		emit += r.Flush()
-		if len(calls) == 0 {
+		if strings.Contains(text, markupPipe) {
+			emit, calls := r.Feed(text)
+			emit += r.Flush()
+			if len(calls) == 0 {
+				continue
+			}
+			msg["content"] = emit
+			msg["tool_calls"] = markupMessageToolCalls(calls)
+			c["finish_reason"] = "tool_calls"
 			continue
 		}
-		msg["content"] = emit
-		msg["tool_calls"] = markupMessageToolCalls(calls)
-		c["finish_reason"] = "tool_calls"
+		// XML 方言（见 xmltool.go）：Step 系等模型输出 <tool_call><name><parameter=...>
+		if strings.Contains(text, xmlOpenTag) {
+			xr := NewMarkupRepair(allowed, allowUnknown)
+			emit, calls := xr.Feed(text)
+			emit += xr.Flush()
+			if len(calls) == 0 {
+				continue
+			}
+			msg["content"] = emit
+			msg["tool_calls"] = markupMessageToolCalls(calls)
+			c["finish_reason"] = "tool_calls"
+			continue
+		}
 	}
 	return r
 }
