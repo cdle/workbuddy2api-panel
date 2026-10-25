@@ -142,6 +142,8 @@ func (h *Handler) streamResponsesOut(w http.ResponseWriter, req map[string]any, 
 		}
 	}
 	converter := NewStreamingConverter(isCompaction)
+	converter.SetResponseID(stringValue(req["response_id"]))
+	converter.SetModel(stringValue(req["model"]))
 	buf := make([]byte, 8192)
 	for {
 		n, rerr := resp.Body.Read(buf)

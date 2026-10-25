@@ -89,18 +89,26 @@ type MarkupCall struct {
 }
 
 // MarkupRepair 是流式与非流式共用的标记修复状态机。
-// 非并发安全：一条响应流一个实例。零值不可用，请用 NewMarkupRepair 构造。
+// 非并发安全：一条响应流一个实例。零值不可用，请用 NewMarkupRepair / NewXMLRepair 构造。
+//
+// 状态机本身与具体方言无关：openTag/closeTag 定块边界，parseBlock 定块内语法。
+// 两种方言共用同一套「起点候选 → 块内累积 → 解析 → 绝不吞字节」逻辑：
+//   - DSML 方言（DeepSeek 系）：NewMarkupRepair，标记见 markupOpen/markupClose
+//   - XML 方言（Step 系）：NewXMLRepair，标记见 xmltool.go 的 xmlOpenTag/xmlCloseTag
 type MarkupRepair struct {
 	allowed      map[string]bool
 	allowUnknown bool
+	openTag      string // 块开始标记（如 markupOpen / xmlOpenTag）
+	closeTag     string // 块结束标记（如 markupClose / xmlCloseTag）
+	parseBlock   func(inner string, allowed map[string]bool) ([]MarkupCall, bool)
 	hold         string // 已确认可能属于标记、但还不足以判定的尾部缓冲
-	inBlock      bool   // 已消费掉 markupOpen，正在块内部累积
+	inBlock      bool   // 已消费掉 openTag，正在块内部累积
 	seen         int    // 识别到的标记块数（含被拒绝的）
 	rejected     int    // 识别到但未转换的块数（观测/排障用）
-	converted    int    // 已还原的调用数（观测用）
+	converted    int   // 已还原的调用数（观测用）
 }
 
-// NewMarkupRepair 按客户端声明的工具名构造修复器。
+// NewMarkupRepair 按客户端声明的工具名构造修复器（DSML 方言，DeepSeek 系模型）。
 //
 // allowed 为请求体里提取到的工具名集合（可能为空——tools 声明在中转环节丢失是常态）。
 // allowUnknown 为 true 时启用弱判定：名单为空也尝试修复，改由「块结构完美 + 工具名
@@ -108,7 +116,25 @@ type MarkupRepair struct {
 //
 // 两者都为空/为 false → 修复器整体禁用（Enabled() 为 false），Feed 恒等透传。
 func NewMarkupRepair(allowed map[string]bool, allowUnknown bool) *MarkupRepair {
-	return &MarkupRepair{allowed: allowed, allowUnknown: allowUnknown}
+	return &MarkupRepair{
+		allowed:      allowed,
+		allowUnknown: allowUnknown,
+		openTag:      markupOpen,
+		closeTag:     markupClose,
+		parseBlock:   parseMarkupBlock,
+	}
+}
+
+// NewXMLRepair 构造 XML 方言修复器（Step 系模型，见 xmltool.go）。
+// 与 NewMarkupRepair 共享同一状态机，只换起止标记与块内解析器。
+func NewXMLRepair(allowed map[string]bool, allowUnknown bool) *MarkupRepair {
+	return &MarkupRepair{
+		allowed:      allowed,
+		allowUnknown: allowUnknown,
+		openTag:      xmlOpenTag,
+		closeTag:     xmlCloseTag,
+		parseBlock:   parseXMLBlock,
+	}
 }
 
 // Enabled 报告修复器是否启用。
@@ -156,27 +182,27 @@ func (r *MarkupRepair) Feed(text string) (string, []MarkupCall) {
 	var calls []MarkupCall
 	for {
 		if !r.inBlock {
-			i := markupStartCandidate(s)
+			i := tagStartCandidate(s, r.openTag)
 			if i < 0 {
 				emit.WriteString(s)
 				break
 			}
-			if len(s)-i < len(markupOpen) {
+			if len(s)-i < len(r.openTag) {
 				// 起点被截断在增量边界（上游把标记切成了两片）：留到下一片再判定。
 				emit.WriteString(s[:i])
 				r.hold = s[i:]
 				break
 			}
 			emit.WriteString(s[:i])
-			s = s[i+len(markupOpen):]
+			s = s[i+len(r.openTag):]
 			r.inBlock = true
 			continue
 		}
-		k := strings.Index(s, markupClose)
+		k := strings.Index(s, r.closeTag)
 		if k < 0 {
 			if len(s) > markupMaxBlockBytes {
 				// 超长未闭合：不是标记，原文回吐并退出块态。
-				emit.WriteString(markupOpen)
+				emit.WriteString(r.openTag)
 				emit.WriteString(s)
 				r.inBlock = false
 				break
@@ -185,19 +211,19 @@ func (r *MarkupRepair) Feed(text string) (string, []MarkupCall) {
 			break
 		}
 		inner := s[:k]
-		s = s[k+len(markupClose):]
+		s = s[k+len(r.closeTag):]
 		r.inBlock = false
 		r.seen++
-		if got, ok := parseMarkupBlock(inner, r.allowed); ok {
+		if got, ok := r.parseBlock(inner, r.allowed); ok {
 			calls = append(calls, got...)
 			r.converted += len(got)
 			continue
 		}
 		// 块内不是纯调用（夹带正文 / 工具名不合规 / 参数畸形）：原文回吐，绝不吞字节。
 		r.rejected++
-		emit.WriteString(markupOpen)
+		emit.WriteString(r.openTag)
 		emit.WriteString(inner)
-		emit.WriteString(markupClose)
+		emit.WriteString(r.closeTag)
 	}
 	return emit.String(), calls
 }
@@ -210,29 +236,29 @@ func (r *MarkupRepair) Flush() string {
 	}
 	out := r.hold
 	if r.inBlock {
-		out = markupOpen + r.hold
+		out = r.openTag + r.hold
 	}
 	r.hold = ""
 	r.inBlock = false
 	return out
 }
 
-// markupStartCandidate 返回 s 中最早的「可能是 markupOpen 起点」的下标：该位置之后
-// 要么正好是完整的 markupOpen，要么是 markupOpen 的一个前缀（被增量边界截断）。
-// 没有候选返回 -1。
-func markupStartCandidate(s string) int {
+// tagStartCandidate 返回 s 中最早的「可能是 open 起点」的下标：该位置之后
+// 要么正好是完整的 open，要么是 open 的一个前缀（被增量边界截断）。
+// 没有候选返回 -1。DSML 与 XML 两种方言共用（两种 open 都以 '<' 开头）。
+func tagStartCandidate(s, open string) int {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '<' {
 			continue
 		}
 		rest := s[i:]
-		if len(rest) >= len(markupOpen) {
-			if rest[:len(markupOpen)] == markupOpen {
+		if len(rest) >= len(open) {
+			if rest[:len(open)] == open {
 				return i
 			}
 			continue
 		}
-		if strings.HasPrefix(markupOpen, rest) {
+		if strings.HasPrefix(open, rest) {
 			return i
 		}
 	}
@@ -448,7 +474,7 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 		}
 		// XML 方言（见 xmltool.go）：Step 系等模型输出 <tool_call><name><parameter=...>
 		if strings.Contains(text, xmlOpenTag) {
-			xr := NewMarkupRepair(allowed, allowUnknown)
+			xr := NewXMLRepair(allowed, allowUnknown)
 			emit, calls := xr.Feed(text)
 			emit += xr.Flush()
 			if len(calls) == 0 {

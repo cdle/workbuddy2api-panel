@@ -294,10 +294,32 @@ func ConvertRequest(data map[string]any, cfg respProxyConfig) map[string]any {
 			msg, ok := normalizeInputItem(item, tc)
 			if ok {
 				messages = append(messages, msg.toChatMessage())
+				continue
+			}
+			// Codex sends compaction_trigger as an input control. Generic
+			// chat upstreams reject it, so do not forward it. This marker
+			// intentionally preserves an explicit user turn and is removed
+			// before dispatch.
+			if dict, ok := item.(map[string]any); ok && stringValue(dict["type"]) == "compaction_trigger" {
+				messages = append(messages, map[string]any{
+					"role":    "user",
+					"content": codexCompactionMarker,
+				})
 			}
 		}
 	}
-	messages = collapseSystemMessages(messages)
+	for i, msg := range messages {
+		if m, ok := msg.(map[string]any); ok && stringValue(m["content"]) == codexCompactionMarker {
+			messages[i] = nil
+		}
+	}
+	clean := messages[:0]
+	for _, msg := range messages {
+		if msg != nil {
+			clean = append(clean, msg)
+		}
+	}
+	messages = collapseSystemMessages(clean)
 	chatData["messages"] = messages
 
 	// ---- token limit ----
@@ -503,10 +525,10 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 	}
 	if isCompaction {
 		output = append(output, map[string]any{
-			"type":             "compaction",
-			"id":               "compaction_" + strings.TrimPrefix(responseID, "resp_"),
+			"type":              "compaction",
+			"id":                "compaction_" + strings.TrimPrefix(responseID, "resp_"),
 			"encrypted_content": strings.ReplaceAll(messageText, "\n", "\\n"),
-			"status":           "completed",
+			"status":            "completed",
 		})
 	}
 	if len(message) > 0 && !isCompaction {
@@ -1753,6 +1775,7 @@ func NormalizeUpstreamError(body map[string]any) map[string]any {
 type StreamingConverter struct {
 	initialized          bool
 	isCompactionRequest  bool
+	compactionEventSent  bool
 	outputItemAdded      bool
 	contentPartAdded     bool
 	textDone             bool
@@ -1808,13 +1831,62 @@ type streamToolCall struct {
 	OutputIndex *int
 }
 
+func (c *StreamingConverter) SetResponseID(id string) {
+	if strings.TrimSpace(id) != "" {
+		c.responseID = convertID(id)
+	}
+}
+
+func (c *StreamingConverter) SetModel(model string) {
+	if strings.TrimSpace(model) != "" {
+		c.model = model
+	}
+}
+
 func NewStreamingConverter(isCompactionReq bool) *StreamingConverter {
 	return &StreamingConverter{
 		isCompactionRequest: isCompactionReq,
-		messageRole:  "assistant",
-		toolCalls:    map[int]*streamToolCall{},
-		rawReasoning: map[string]any{},
-		usage:        map[string]any{},
+		messageRole:         "assistant",
+		toolCalls:           map[int]*streamToolCall{},
+		rawReasoning:        map[string]any{},
+		usage:               map[string]any{},
+	}
+}
+
+const codexCompactionMarker = "\u0000codex-compaction\u0000"
+
+const codexCompactionInstruction = "请总结以上完整对话历史，保留任务目标、关键决策、重要文件路径、当前状态和下一步行动。直接输出简洁摘要，不要提问，不要使用工具。"
+
+// codexCompactionDoneEvent emits the only output item Codex remote compaction
+// v2 counts. Per Codex source, response.completed.response.output is not
+// scanned, so this must arrive as response.output_item.done before completed.
+func (c *StreamingConverter) codexCompactionDoneEvent() []string {
+	if c.compactionEventSent {
+		return nil
+	}
+	c.compactionEventSent = true
+	c.outputItemDone = true
+
+	content := strings.TrimSpace(c.fullText)
+	if content == "" {
+		content = "Remote conversation compaction completed."
+	}
+	id := valueOrDefault(c.responseID, "resp_compaction_unknown").(string)
+	prefix := "compaction_" + strings.TrimPrefix(strings.TrimPrefix(id, "resp-"), "resp_")
+	item := map[string]any{
+		"type": "compaction", "id": prefix,
+		"encrypted_content": content,
+	}
+	if c.model != "" {
+		item["internal_chat_message_metadata_passthrough"] = map[string]any{
+			"model": c.model,
+		}
+	}
+	return []string{
+		c.nextEvent("response.output_item.done", map[string]any{
+			"output_index": 0,
+			"item":         item,
+		}),
 	}
 }
 
@@ -1955,6 +2027,9 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 	}
 	if finishReason != "" && !c.outputItemDone {
 		status := c.finalStatus()
+		if c.isCompactionRequest {
+			events = append(events, c.codexCompactionDoneEvent()...)
+		}
 		events = append(events, c.finishOutputItems()...)
 		events = append(events, c.finishResponse(status)...)
 	}
@@ -1974,6 +2049,9 @@ func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
 	}
 	c.reasoningText += delta
 	c.sawSubstantiveOutput = true
+	if c.isCompactionRequest {
+		return nil
+	}
 	events := c.ensureReasoningItem()
 	events = append(events, c.nextEvent("response.reasoning_summary_text.delta", map[string]any{
 		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
@@ -1988,6 +2066,9 @@ func (c *StreamingConverter) appendVisibleDelta(delta string) []string {
 	}
 	c.fullText += delta
 	c.sawSubstantiveOutput = true
+	if c.isCompactionRequest {
+		return nil
+	}
 	events := c.ensureContentPart()
 	events = append(events, c.nextEvent("response.output_text.delta", map[string]any{
 		"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
@@ -2182,14 +2263,6 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 	}
 	c.completed = true
 	output := c.buildOutput()
-	if c.isCompactionRequest {
-		output = append(output, map[string]any{
-			"type":             "compaction",
-			"id":               "compaction_" + strings.TrimPrefix(valueOrDefault(c.responseID, "resp_unknown").(string), "resp_"),
-			"encrypted_content": strings.ReplaceAll(c.fullText, "\n", "\\n"),
-			"status":           "completed",
-		})
-	}
 	return []string{c.nextEvent("response.completed", map[string]any{
 		"response": map[string]any{
 			"id":     valueOrDefault(c.responseID, "resp_unknown"),

@@ -404,9 +404,14 @@ func applyCodexCatalogFields(entry map[string]any) {
 }
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	list := h.modelList()
+	// 双形态输出：OpenAI 风格客户端读 "data"，Codex 原生 catalog 读 "models"
+	// （codex-rs/protocol/openai_models.rs 的 ModelsResponse 只认 "models"，
+	// 少这个键 serde 直接报 missing field，客户端模型目录刷新全失败）。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
+		"models": list,
 	})
 }
 
@@ -1178,7 +1183,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
-			xmlRepair := upstream.NewMarkupRepair(declaredTools, true)
+			xmlRepair := upstream.NewXMLRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),

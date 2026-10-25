@@ -47,3 +47,6 @@ server.exe
 .DS_Store
 /workbuddy2api
 /workbuddy2api.pre-catalog
+
+# 本地构建/部署备份
+/workbuddy2api.bak.*

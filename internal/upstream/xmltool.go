@@ -37,26 +37,6 @@ var xmlToolNameRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$`)
 // xmlMaxBlockBytes 单块上限，超过即判为正文，避免把大段正文误当工具调用。
 const xmlMaxBlockBytes = 256 * 1024
 
-// xmlStartCandidate 返回 s 中最早的「可能是 xmlOpenTag 起点」的下标。
-func xmlStartCandidate(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] != 60 {
-			continue
-		}
-		rest := s[i:]
-		if len(rest) >= len(xmlOpenTag) {
-			if rest[:len(xmlOpenTag)] == xmlOpenTag {
-				return i
-			}
-			continue
-		}
-		if strings.HasPrefix(xmlOpenTag, rest) {
-			return i
-		}
-	}
-	return -1
-}
-
 // parseXMLBlock 解析一个工具调用块（xmlOpenTag 与 xmlCloseTag 之间的内容）。
 //
 // 期望形态：<工具名>...<parameter=参数名>值</parameter>...</工具名>

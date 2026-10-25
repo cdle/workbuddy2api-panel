@@ -62,7 +62,7 @@ func TestConvertResponseBasics(t *testing.T) {
 }
 
 func TestStreamingConverterEvents(t *testing.T) {
-	c := NewStreamingConverter()
+	c := NewStreamingConverter(false)
 	chunk := []byte("data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\u6536\u5230\"},\"index\":0}]}\n\n")
 	events := c.Feed(chunk)
 	if len(events) == 0 {
