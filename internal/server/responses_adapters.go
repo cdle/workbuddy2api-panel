@@ -488,7 +488,28 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 		})
 	}
 
-	if len(message) > 0 {
+	// Detect compaction request: input contains a compaction_trigger item.
+	// When present, append a synthetic Compaction output item so Codex's
+	// collect_compaction_output sees exactly one Compaction item and completes.
+	isCompaction := false
+	if input, _ := originalReq["input"].([]any); len(input) > 0 {
+		for _, item := range input {
+			dict, _ := item.(map[string]any)
+			if stringValue(dict["type"]) == "compaction_trigger" {
+				isCompaction = true
+				break
+			}
+		}
+	}
+	if isCompaction {
+		output = append(output, map[string]any{
+			"type":             "compaction",
+			"id":               "compaction_" + strings.TrimPrefix(responseID, "resp_"),
+			"encrypted_content": strings.ReplaceAll(messageText, "\n", "\\n"),
+			"status":           "completed",
+		})
+	}
+	if len(message) > 0 && !isCompaction {
 		item := buildOutputItem(message, responseID, finishReason, tc, messageText)
 		if item != nil {
 			output = append(output, item)
@@ -1731,6 +1752,7 @@ func NormalizeUpstreamError(body map[string]any) map[string]any {
 
 type StreamingConverter struct {
 	initialized          bool
+	isCompactionRequest  bool
 	outputItemAdded      bool
 	contentPartAdded     bool
 	textDone             bool
@@ -1786,8 +1808,9 @@ type streamToolCall struct {
 	OutputIndex *int
 }
 
-func NewStreamingConverter() *StreamingConverter {
+func NewStreamingConverter(isCompactionReq bool) *StreamingConverter {
 	return &StreamingConverter{
+		isCompactionRequest: isCompactionReq,
 		messageRole:  "assistant",
 		toolCalls:    map[int]*streamToolCall{},
 		rawReasoning: map[string]any{},
@@ -2158,11 +2181,20 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 		return nil
 	}
 	c.completed = true
+	output := c.buildOutput()
+	if c.isCompactionRequest {
+		output = append(output, map[string]any{
+			"type":             "compaction",
+			"id":               "compaction_" + strings.TrimPrefix(valueOrDefault(c.responseID, "resp_unknown").(string), "resp_"),
+			"encrypted_content": strings.ReplaceAll(c.fullText, "\n", "\\n"),
+			"status":           "completed",
+		})
+	}
 	return []string{c.nextEvent("response.completed", map[string]any{
 		"response": map[string]any{
 			"id":     valueOrDefault(c.responseID, "resp_unknown"),
 			"object": "response", "created_at": c.created, "status": status,
-			"output": c.buildOutput(), "usage": c.buildUsage(),
+			"output": output, "usage": c.buildUsage(),
 		},
 	})}
 }

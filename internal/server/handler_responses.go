@@ -131,7 +131,17 @@ func (h *Handler) streamResponsesOut(w http.ResponseWriter, req map[string]any, 
 		return
 	}
 
-	converter := NewStreamingConverter()
+	isCompaction := false
+	if input, _ := req["input"].([]any); len(input) > 0 {
+		for _, item := range input {
+			dict, _ := item.(map[string]any)
+			if s, _ := dict["type"].(string); s == "compaction_trigger" {
+				isCompaction = true
+				break
+			}
+		}
+	}
+	converter := NewStreamingConverter(isCompaction)
 	buf := make([]byte, 8192)
 	for {
 		n, rerr := resp.Body.Read(buf)
